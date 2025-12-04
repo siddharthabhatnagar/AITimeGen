@@ -1,3 +1,5 @@
-Flask==1.1.4
-ortools==9.14.6206
+Flask
+jinja2
+markupsafe
 gunicorn
+ortools==9.14.6206
