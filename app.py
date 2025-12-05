@@ -12,7 +12,7 @@ class Teacher:
         self.id = id
         self.name = name
         self.subject_ids = subject_ids
-        self.unavailable_slots = set(unavailable_slots)  # set for faster lookup
+        self.unavailable_slots = set(unavailable_slots)
 
 class Section:
     def __init__(self, id, name, subject_ids):
@@ -42,13 +42,17 @@ class LectureSlot:
         self.end_time = end_time
 
 # --------------------------
-# Single Section Timetable Generator
+# Timetable Generator
 # --------------------------
 def create_timetable_for_section(section, teachers, rooms, subjects, lecture_slots):
     model = cp_model.CpModel()
     subject_map = {s.id: s for s in subjects}
 
-    # Variables: (slot, subject, teacher, room) -> Boolean
+    # Check for missing subjects
+    missing_subjects = [s_id for s_id in section.subject_ids if s_id not in subject_map]
+    if missing_subjects:
+        return {"error": f"Subjects not found: {missing_subjects}", "status": "fail"}
+
     assignment = {}
     for slot_idx, _ in enumerate(lecture_slots):
         for subj_id in section.subject_ids:
@@ -70,9 +74,10 @@ def create_timetable_for_section(section, teachers, rooms, subjects, lecture_slo
     for subj_id in section.subject_ids:
         required_lec = subject_map[subj_id].lec_per_week
         vars_list = [var for (slot_idx, s_id, t_id, r_id), var in assignment.items() if s_id == subj_id]
-        model.Add(sum(vars_list) == required_lec)
+        if vars_list:
+            model.Add(sum(vars_list) == required_lec)
 
-    # 2. Only one teacher teaches all lectures for a subject
+    # 2. Only one teacher per subject
     for subj_id in section.subject_ids:
         qualified_teachers = [t for t in teachers if subj_id in t.subject_ids]
         teacher_chosen_vars = []
@@ -81,8 +86,9 @@ def create_timetable_for_section(section, teachers, rooms, subjects, lecture_slo
             teacher_chosen_vars.append(is_chosen)
             lecture_vars = [var for (slot_idx, s_id, t_id, r_id), var in assignment.items()
                             if s_id == subj_id and t_id == teacher.id]
-            model.Add(sum(lecture_vars) > 0).OnlyEnforceIf(is_chosen)
-            model.Add(sum(lecture_vars) == 0).OnlyEnforceIf(is_chosen.Not())
+            if lecture_vars:
+                model.Add(sum(lecture_vars) > 0).OnlyEnforceIf(is_chosen)
+                model.Add(sum(lecture_vars) == 0).OnlyEnforceIf(is_chosen.Not())
         if teacher_chosen_vars:
             model.Add(sum(teacher_chosen_vars) == 1)
 
@@ -107,19 +113,16 @@ def create_timetable_for_section(section, teachers, rooms, subjects, lecture_slo
     status = solver.Solve(model)
 
     if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-        return []
+        return {"error": "No feasible timetable found", "status": "fail"}
 
     timetable = []
-    # Update teacher and room availability after assignment
     for (slot_idx, subj_id, teacher_id, room_id), var in assignment.items():
         if solver.BooleanValue(var):
             slot = lecture_slots[slot_idx]
             teacher = next(t for t in teachers if t.id == teacher_id)
             room = next(r for r in rooms if r.id == room_id)
-            # Mark them unavailable for this slot for next section
             teacher.unavailable_slots.add(slot_idx)
             room.unavailable_slots.add(slot_idx)
-
             timetable.append({
                 "section": section.name,
                 "subject": subject_map[subj_id].name,
@@ -130,7 +133,7 @@ def create_timetable_for_section(section, teachers, rooms, subjects, lecture_slo
                 "end_time": slot.end_time
             })
 
-    return timetable
+    return {"timetable": timetable, "status": "success"}
 
 # --------------------------
 # Flask API
@@ -139,14 +142,21 @@ def create_timetable_for_section(section, teachers, rooms, subjects, lecture_slo
 def generate_section_timetable():
     data = request.get_json()
     try:
-        teachers = [Teacher(**t) for t in data["teachers"]]
-        rooms = [Room(**r) for r in data["rooms"]]
-        subjects = [Subject(**s) for s in data["subjects"]]
-        lecture_slots = [LectureSlot(**l) for l in data["lectureSlots"]]
-        section = Section(**data["section"])  # Single section
+        teachers = [Teacher(**t) for t in data.get("teachers", [])]
+        rooms = [Room(**r) for r in data.get("rooms", [])]
+        subjects = [Subject(**s) for s in data.get("subjects", [])]
+        lecture_slots = [LectureSlot(**l) for l in data.get("lectureSlots", [])]
+        section_data = data.get("section", {})
 
-        timetable = create_timetable_for_section(section, teachers, rooms, subjects, lecture_slots)
-        return jsonify({"timetable": timetable, "status": "success"})
+        if not section_data:
+            return jsonify({"error": "Section data missing", "status": "fail"}), 400
+
+        section = Section(**section_data)
+        result = create_timetable_for_section(section, teachers, rooms, subjects, lecture_slots)
+
+        status_code = 200 if result.get("status") == "success" else 500
+        return jsonify(result), status_code
+
     except Exception as e:
         return jsonify({"error": str(e), "status": "fail"}), 500
 
